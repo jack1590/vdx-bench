@@ -1,0 +1,106 @@
+name: Benchmark
+
+# Scores a private build of vdx on the benchmark's ELF set, on free public runners. The private
+# repo builds a bundle (vdx, the harness, the corpus sources), pushes it as a private package this
+# repo may only read, and dispatches this run with its digest. Each shard's scorecard carries a
+# provenance stamp; the private repo verifies it and runs the ratchet. This repo holds no secret.
+# Source of truth: scripts/ci/public/bench.yml in the private repo; the private gate fails when
+# this file differs from it.
+run-name: ${{ inputs.full && 'Full matrix' || 'PR set' }} ${{ inputs.digest }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      digest:
+        description: The bundle's digest in ghcr.io/jack1590/vdx-bench-bundle (sha256:...)
+        required: true
+        type: string
+      full:
+        description: Every --full cell on 6 shards (the full matrix) instead of the PR set on 4
+        type: boolean
+        default: false
+
+permissions: {}
+
+jobs:
+  shard:
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(inputs.full && '[1, 2, 3, 4, 5, 6]' || '[1, 2, 3, 4]') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.full && 90 || 30 }}
+    permissions:
+      packages: read # the bundle; this repo's Actions access to the private package is Read
+    env:
+      DIGEST: ${{ inputs.digest }}
+      FULL: ${{ inputs.full }}
+      SHARD: ${{ matrix.shard }}/${{ inputs.full && 6 || 4 }}
+    steps:
+      # the inputs reach scripts only through env, and the digest is checked before any use
+      - name: Pull the bundle
+        env:
+          TOKEN: ${{ github.token }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::not a digest: $DIGEST"; exit 1; }
+          image="ghcr.io/jack1590/vdx-bench-bundle@$DIGEST"
+          echo "$TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull -q "$image"
+          docker logout ghcr.io
+          id=$(docker create "$image")
+          docker cp "$id:/bundle.tar" "$RUNNER_TEMP/bundle.tar"
+          docker rm "$id"
+          # vdx outside the workspace: never in a cached path or an artifact
+          tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP" vdx bundle.json
+          mkdir b && tar -xf "$RUNNER_TEMP/bundle.tar" -C b --exclude vdx --exclude bundle.json
+          sum=$(sha256sum "$RUNNER_TEMP/vdx" | cut -d' ' -f1)
+          [ "$(jq -r .vdx_sha256 "$RUNNER_TEMP/bundle.json")" = "$sum" ] || { echo "::error::vdx doesn't match the bundle's sha256"; exit 1; }
+          [ "$(jq -r .full "$RUNNER_TEMP/bundle.json")" = "$FULL" ] || { echo "::error::the bundle was built for full=$(jq -r .full "$RUNNER_TEMP/bundle.json")"; exit 1; }
+          echo "VDX_SHA256=$sum" >> "$GITHUB_ENV"
+          jq . "$RUNNER_TEMP/bundle.json"
+      # the Rust cells need rustc 1.94.0 with the Linux std; b/rust-toolchain.toml selects it
+      - run: rustup toolchain install 1.94.0 --profile minimal --no-self-update
+      # keyed like the private ci.yml and full-matrix.yml shards
+      - id: tc
+        run: echo "tc=$( (gcc-13 -dumpfullversion || gcc -dumpfullversion) 2>/dev/null)-$(dpkg-query -W -f='${Version}' binutils 2>/dev/null)" >> "$GITHUB_OUTPUT"
+      - id: bench-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            b/benchmark/.cache
+            ~/.cache/zig-0.17.0
+          key: ${{ inputs.full && 'full' || 'bench' }}-${{ matrix.shard }}-${{ steps.tc.outputs.tc }}-${{ hashFiles('b/benchmark/manifest.json', 'b/corpus/src/**', 'b/scripts/benchmark/*.py', '!b/scripts/benchmark/test_benchmark.py', 'b/scripts/benchmark/setup-ci.sh') }}
+          restore-keys: ${{ inputs.full && 'full' || 'bench' }}-${{ matrix.shard }}-
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cache/llvm-22.1.8
+            ~/.cache/go-1.27.3
+          key: llvm-22.1.8-${{ hashFiles('b/scripts/benchmark/setup-ci.sh') }}
+      - run: b/scripts/benchmark/setup-ci.sh
+      # the full matrix's cells and deadline, as full-matrix.yml's private shards
+      - run: |
+          full=()
+          [ "$FULL" = true ] && full=(--full --deadline 4200)
+          python3 b/scripts/benchmark/bench.py run --set elf --shard "$SHARD" --vdx "$RUNNER_TEMP/vdx" --out shard.json "${full[@]}"
+      - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: ${{ !cancelled() && steps.bench-cache.outputs.cache-hit != 'true' }}
+        with:
+          path: |
+            b/benchmark/.cache
+            ~/.cache/zig-0.17.0
+          key: ${{ steps.bench-cache.outputs.cache-primary-key }}
+      # what the private gate checks: this private commit, run and vdx, this run, this shard
+      - run: |
+          k=${SHARD%/*}
+          jq --arg vdx "$VDX_SHA256" --arg digest "$DIGEST" --arg run "$GITHUB_RUN_ID" --arg shard "$SHARD" \
+            --slurpfile b "$RUNNER_TEMP/bundle.json" \
+            '.provenance = ($b[0] | {private_sha, private_run_id, private_run_attempt, full}) + {vdx_sha256: $vdx, digest: $digest, public_run_id: $run, shard: $shard}' \
+            shard.json > "shard-$k.json"
+          jq .provenance "shard-$k.json"
+          echo "K=$k" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: public-shard-${{ env.K }}
+          path: shard-${{ env.K }}.json
+          retention-days: 7
