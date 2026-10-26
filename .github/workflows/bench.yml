@@ -3,7 +3,9 @@ name: Benchmark
 # Scores a private build of vdx on the benchmark's ELF set, on free public runners. The private
 # repo builds a bundle (vdx, the harness, the corpus sources), pushes it as a private package this
 # repo may only read, and dispatches this run with its digest. Each shard's scorecard carries a
-# provenance stamp; the private repo verifies it and runs the ratchet. This repo holds no secret.
+# provenance stamp and is encrypted to the private repo's certificate (it comes in the bundle), so
+# the per-build scores never show here; the private repo decrypts, verifies the stamp and runs the
+# ratchet. This repo holds no secret.
 # Source of truth: scripts/ci/public/bench.yml in the private repo; the private gate fails when
 # this file differs from it.
 run-name: ${{ inputs.full && 'Full matrix' || 'PR set' }} ${{ inputs.digest }}
@@ -98,9 +100,11 @@ jobs:
             '.provenance = ($b[0] | {private_sha, private_run_id, private_run_attempt, full}) + {vdx_sha256: $vdx, digest: $digest, public_run_id: $run, shard: $shard}' \
             shard.json > "shard-$k.json"
           jq .provenance "shard-$k.json"
+          openssl cms -encrypt -binary -aes256 -in "shard-$k.json" -outform DER -out "shard-$k.json.cms" \
+            -recip b/scripts/ci/public/results-cert.pem -keyopt rsa_padding_mode:oaep
           echo "K=$k" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: public-shard-${{ env.K }}
-          path: shard-${{ env.K }}.json
+          path: shard-${{ env.K }}.json.cms
           retention-days: 7
