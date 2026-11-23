@@ -80,12 +80,16 @@ jobs:
             ~/.cache/go-1.27.3
           key: llvm-22.1.8-${{ hashFiles('b/scripts/benchmark/setup-ci.sh') }}
       - run: b/scripts/benchmark/setup-ci.sh
-      # the full matrix's cells and deadline, as full-matrix.yml's private shards
+      # B4-2: Csmith for the full matrix's b4-csmith set, three pinned Ubuntu packages, unpacked and never installed
+      - if: ${{ inputs.full }}
+        run: b/scripts/benchmark/b4/setup-csmith.sh
+      # the full matrix's cells and deadline, as full-matrix.yml's private shards, and its b4-csmith set with the
+      # night's fresh seeds, drawn from the private run's id
       - env:
           VDX_B4: "1"
         run: |
           full=()
-          [ "$FULL" = true ] && full=(--full --deadline 4200)
+          [ "$FULL" = true ] && full=(--full --deadline 4200 --csmith "$CSMITH_ROOT" --fresh "$(jq -r .private_run_id "$RUNNER_TEMP/bundle.json")")
           python3 b/scripts/benchmark/bench.py run --set elf --shard "$SHARD" --vdx "$RUNNER_TEMP/vdx" --out shard.json "${full[@]}"
       - uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: ${{ !cancelled() && steps.bench-cache.outputs.cache-hit != 'true' }}
